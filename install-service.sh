@@ -23,6 +23,15 @@ if [ -z "$BUN_BIN" ]; then
   exit 1
 fi
 
+NPX_BIN="$(which npx 2>/dev/null || true)"
+if [ -z "$NPX_BIN" ]; then
+  echo "error: npx not found in PATH"
+  echo "Install Node.js: https://nodejs.org"
+  exit 1
+fi
+# Capture full PATH for launchd (which runs with a minimal environment)
+FULL_PATH="$PATH"
+
 # ── macOS ─────────────────────────────────────────────────────────────────────
 
 install_macos() {
@@ -66,6 +75,8 @@ install_macos() {
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>PATH</key>
+        <string>$FULL_PATH</string>
 $ENV_BLOCK    </dict>
 
     <key>RunAtLoad</key>
