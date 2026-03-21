@@ -1,18 +1,18 @@
 /**
- * Hermod Poller — runs locally, consumes Redis queue, triggers Paperclip heartbeats.
+ * Hermod Poller — runs locally, polls Hermod server, triggers Paperclip heartbeats.
  *
  * Usage: bun run poller.ts
- * Env: REDIS_URL, PAPERCLIP_API_URL, PAPERCLIP_COMPANY_ID
+ * Env: HERMOD_URL, POLL_SECRET, PAPERCLIP_API_URL, PAPERCLIP_COMPANY_ID, PAPERCLIP_CEO_AGENT_ID
  */
 
-const REDIS_URL = process.env.REDIS_URL!;
+const HERMOD_URL = process.env.HERMOD_URL!;
+const POLL_SECRET = process.env.POLL_SECRET!;
 const PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL!;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID!;
 const CEO_AGENT_ID = process.env.PAPERCLIP_CEO_AGENT_ID!;
 const POLL_INTERVAL = Number(process.env.POLL_INTERVAL_MS) || 30_000;
-const QUEUE_KEY = "hermod:events";
 
-for (const v of ["REDIS_URL", "PAPERCLIP_API_URL", "PAPERCLIP_COMPANY_ID", "PAPERCLIP_CEO_AGENT_ID"]) {
+for (const v of ["HERMOD_URL", "POLL_SECRET", "PAPERCLIP_API_URL", "PAPERCLIP_COMPANY_ID", "PAPERCLIP_CEO_AGENT_ID"]) {
   if (!process.env[v]) throw new Error(`${v} is required`);
 }
 
@@ -57,7 +57,6 @@ function extractDonIdentifier(branch: string | null, title: string): string | nu
   if (branch) {
     const donMatch = branch.match(/DON-(\d+)/i);
     if (donMatch) return `DON-${donMatch[1]}`;
-    // Also match <repo>-<number> style: fix/ariel-64 → try to map if possible
   }
   const titleMatch = title?.match(/DON-(\d+)/i);
   if (titleMatch) return `DON-${titleMatch[1]}`;
@@ -154,40 +153,50 @@ async function processEvent(event: QueueEvent, ceoKey: string): Promise<void> {
   await triggerHeartbeat(agentId, event.repo);
 }
 
-async function poll(redis: any, ceoKey: string): Promise<void> {
-  let count = 0;
-  while (true) {
-    const raw = await redis.send("LPOP", [QUEUE_KEY]);
-    if (!raw) break;
-    count++;
+async function poll(ceoKey: string): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${HERMOD_URL}/poll`, {
+      headers: { Authorization: `Bearer ${POLL_SECRET}` },
+    });
+  } catch (e) {
+    log("ERROR", "could not reach Hermod server", { error: String(e) });
+    return;
+  }
+
+  if (!res.ok) {
+    log("ERROR", "poll request failed", { status: res.status });
+    return;
+  }
+
+  const { events } = (await res.json()) as { events: QueueEvent[] };
+  for (const event of events) {
     try {
-      const event: QueueEvent = JSON.parse(raw as string);
       await processEvent(event, ceoKey);
     } catch (e) {
       log("ERROR", `failed to process event`, { error: String(e) });
     }
   }
-  if (count > 0) {
-    log("INFO", `poll cycle complete`, { processed: count });
+  if (events.length > 0) {
+    log("INFO", `poll cycle complete`, { processed: events.length });
   }
 }
 
 async function main() {
   log("INFO", "hermod poller starting", {
-    redis: REDIS_URL.replace(/:[^:@]+@/, ":***@"),
+    hermod: HERMOD_URL,
     paperclip: PAPERCLIP_API_URL,
     pollIntervalMs: POLL_INTERVAL,
     mappedRepos: Object.keys(REPO_AGENT_MAP),
   });
 
-  const redis = new Bun.RedisClient(REDIS_URL);
-
-  // Verify Redis connection
+  // Verify Hermod is reachable
   try {
-    await redis.send("PING", []);
-    log("INFO", "Redis connection OK");
+    const res = await fetch(`${HERMOD_URL}/health`);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    log("INFO", "Hermod connection OK");
   } catch (e) {
-    log("ERROR", "Redis connection failed", { error: String(e) });
+    log("ERROR", "Hermod connection failed", { error: String(e) });
     process.exit(1);
   }
 
@@ -199,10 +208,10 @@ async function main() {
   log("INFO", "authenticated as CEO");
 
   // Initial drain
-  await poll(redis, ceoKey);
+  await poll(ceoKey);
 
   log("INFO", `polling every ${POLL_INTERVAL}ms`);
-  setInterval(() => poll(redis, ceoKey), POLL_INTERVAL);
+  setInterval(() => poll(ceoKey), POLL_INTERVAL);
 }
 
 main();

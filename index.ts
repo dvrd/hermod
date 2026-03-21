@@ -3,6 +3,8 @@ import { createHmac, timingSafeEqual } from "crypto";
 const REDIS_URL = process.env.REDIS_URL!;
 if (!REDIS_URL) throw new Error("REDIS_URL is required");
 const WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || "";
+const POLL_SECRET = process.env.POLL_SECRET!;
+if (!POLL_SECRET) throw new Error("POLL_SECRET is required");
 const QUEUE_KEY = "hermod:events";
 const PORT = Number(process.env.PORT) || 3000;
 
@@ -26,10 +28,44 @@ function verifySignature(payload: string, signature: string | null): boolean {
   }
 }
 
+function verifyPollSecret(req: Request): boolean {
+  const auth = req.headers.get("authorization") || "";
+  return auth === `Bearer ${POLL_SECRET}`;
+}
+
 Bun.serve({
   port: PORT,
   routes: {
     "/health": new Response("ok"),
+
+    "/poll": {
+      GET: async (req) => {
+        if (!verifyPollSecret(req)) {
+          log("WARN", "poll: unauthorized");
+          return new Response("unauthorized", { status: 401 });
+        }
+
+        const url = new URL(req.url);
+        const limit = Math.min(Number(url.searchParams.get("limit") || "20"), 100);
+
+        const events: unknown[] = [];
+        for (let i = 0; i < limit; i++) {
+          const raw = await redis.send("LPOP", [QUEUE_KEY]);
+          if (!raw) break;
+          try {
+            events.push(JSON.parse(raw as string));
+          } catch {
+            log("WARN", "poll: skipped unparseable event");
+          }
+        }
+
+        if (events.length > 0) {
+          log("INFO", "poll: drained events", { count: events.length });
+        }
+
+        return Response.json({ events });
+      },
+    },
 
     "/webhook/github": {
       POST: async (req) => {
@@ -66,6 +102,12 @@ Bun.serve({
         if (event === "issue_comment" && !payload.issue?.pull_request) {
           log("INFO", "ignored: issue comment (not a PR)", { delivery });
           return Response.json({ ok: true, msg: "not a PR comment" });
+        }
+
+        const commenter = payload.comment?.user?.login || "";
+        if (commenter.endsWith("[bot]") || payload.comment?.user?.type === "Bot") {
+          log("INFO", "ignored: bot comment", { delivery, author: commenter });
+          return Response.json({ ok: true, msg: "bot comment ignored" });
         }
 
         const repo = payload.repository?.full_name || "";
