@@ -79,14 +79,22 @@ In each repo → Settings → Webhooks → Add webhook:
 - **Secret:** same value as `GITHUB_WEBHOOK_SECRET`
 - **Events:** select `Issue comments` and `Pull request review comments`
 
-### 4. Run the poller locally
+### 4. Install the poller as a background service
 
 ```bash
 bun install
-bun run poller.ts
+cp .env.example .env   # fill in your values
+./install-service.sh   # install + start (macOS & Linux)
+```
+
+To uninstall:
+
+```bash
+./install-service.sh uninstall
 ```
 
 The poller needs your local Paperclip instance running (`PAPERCLIP_API_URL=http://127.0.0.1:3100`).
+It starts automatically on login and restarts if it crashes.
 
 ## Development
 
