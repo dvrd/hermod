@@ -8,6 +8,12 @@ const PORT = Number(process.env.PORT) || 3000;
 
 const redis = new Bun.RedisClient(REDIS_URL);
 
+function log(level: "INFO" | "WARN" | "ERROR", msg: string, meta?: Record<string, unknown>) {
+  const ts = new Date().toISOString();
+  const metaStr = meta ? " " + JSON.stringify(meta) : "";
+  console.log(`[${ts}] ${level} ${msg}${metaStr}`);
+}
+
 function verifySignature(payload: string, signature: string | null): boolean {
   if (!WEBHOOK_SECRET || !signature) return !WEBHOOK_SECRET;
   const expected =
@@ -29,13 +35,16 @@ Bun.serve({
       POST: async (req) => {
         const body = await req.text();
         const sig = req.headers.get("x-hub-signature-256");
+        const event = req.headers.get("x-github-event");
+        const delivery = req.headers.get("x-github-delivery") || "?";
 
         if (!verifySignature(body, sig)) {
+          log("WARN", "invalid signature — rejected", { delivery, event });
           return new Response("invalid signature", { status: 401 });
         }
 
-        const event = req.headers.get("x-github-event");
         if (event === "ping") {
+          log("INFO", "ping received", { delivery });
           return Response.json({ ok: true, msg: "pong" });
         }
 
@@ -43,17 +52,19 @@ Bun.serve({
           event !== "issue_comment" &&
           event !== "pull_request_review_comment"
         ) {
+          log("INFO", `ignored event: ${event}`, { delivery });
           return Response.json({ ok: true, msg: "ignored" });
         }
 
         const payload = JSON.parse(body);
 
         if (payload.action !== "created") {
+          log("INFO", `ignored action: ${payload.action}`, { event, delivery });
           return Response.json({ ok: true, msg: "ignored" });
         }
 
-        // For issue_comment, only process if it's on a PR
         if (event === "issue_comment" && !payload.issue?.pull_request) {
+          log("INFO", "ignored: issue comment (not a PR)", { delivery });
           return Response.json({ ok: true, msg: "not a PR comment" });
         }
 
@@ -89,8 +100,17 @@ Bun.serve({
           timestamp: new Date().toISOString(),
         });
 
-        await redis.send("RPUSH", [QUEUE_KEY, entry]);
-        console.log(`queued: ${repo}#${prNumber} by ${author}`);
+        const queueLen = await redis.send("RPUSH", [QUEUE_KEY, entry]) as number;
+
+        log("INFO", "queued event", {
+          delivery,
+          repo,
+          pr: prNumber,
+          branch: branch ?? "(n/a)",
+          author,
+          comment: comment.slice(0, 80) + (comment.length > 80 ? "…" : ""),
+          queueDepth: queueLen,
+        });
 
         return Response.json({ ok: true, queued: true });
       },
@@ -102,4 +122,4 @@ Bun.serve({
   },
 });
 
-console.log(`hermod listening on :${PORT}`);
+log("INFO", `hermod server listening on :${PORT}`);

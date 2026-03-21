@@ -25,6 +25,12 @@ const REPO_AGENT_MAP: Record<string, string> = Object.fromEntries(
   })
 );
 
+function log(level: "INFO" | "WARN" | "ERROR", msg: string, meta?: Record<string, unknown>) {
+  const ts = new Date().toISOString();
+  const metaStr = meta ? " " + JSON.stringify(meta) : "";
+  console.log(`[${ts}] ${level} ${msg}${metaStr}`);
+}
+
 interface QueueEvent {
   event: string;
   repo: string;
@@ -38,19 +44,8 @@ interface QueueEvent {
 }
 
 async function getPaperclipApiKey(agentId: string): Promise<string | null> {
-  // Use the CEO key to create a comment on the issue, then trigger heartbeat
-  // For triggering heartbeats we need agent-specific keys
-  // We'll use the CLI to get them
   const proc = Bun.spawn(
-    [
-      "npx",
-      "paperclipai",
-      "agent",
-      "local-cli",
-      agentId,
-      "--company-id",
-      COMPANY_ID,
-    ],
+    ["npx", "paperclipai", "agent", "local-cli", agentId, "--company-id", COMPANY_ID],
     { stdout: "pipe", stderr: "pipe" }
   );
   const output = await new Response(proc.stdout).text();
@@ -59,12 +54,11 @@ async function getPaperclipApiKey(agentId: string): Promise<string | null> {
 }
 
 function extractDonIdentifier(branch: string | null, title: string): string | null {
-  // Try branch first: feat/DON-64, fix/onlead-61, etc.
   if (branch) {
     const donMatch = branch.match(/DON-(\d+)/i);
     if (donMatch) return `DON-${donMatch[1]}`;
+    // Also match <repo>-<number> style: fix/ariel-64 → try to map if possible
   }
-  // Try title
   const titleMatch = title?.match(/DON-(\d+)/i);
   if (titleMatch) return `DON-${titleMatch[1]}`;
   return null;
@@ -80,32 +74,25 @@ async function findIssueByIdentifier(
   );
   const issues = (await res.json()) as any[];
   const match = issues.find((i: any) => i.identifier === identifier);
-  return match
-    ? { id: match.id, assigneeAgentId: match.assigneeAgentId }
-    : null;
+  return match ? { id: match.id, assigneeAgentId: match.assigneeAgentId } : null;
 }
 
-async function postComment(
-  issueId: string,
-  body: string,
-  ceoKey: string
-): Promise<void> {
+async function postComment(issueId: string, body: string, ceoKey: string): Promise<void> {
   await fetch(`${PAPERCLIP_API_URL}/api/issues/${issueId}/comments`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${ceoKey}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${ceoKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ body }),
   });
 }
 
-async function triggerHeartbeat(agentId: string): Promise<void> {
+async function triggerHeartbeat(agentId: string, repo: string): Promise<void> {
+  log("INFO", `getting API key for agent`, { agentId: agentId.slice(0, 8) });
   const apiKey = await getPaperclipApiKey(agentId);
   if (!apiKey) {
-    console.error(`  could not get API key for agent ${agentId}`);
+    log("ERROR", `could not get API key for agent`, { agentId: agentId.slice(0, 8), repo });
     return;
   }
+
   const proc = Bun.spawn(
     ["npx", "paperclipai", "heartbeat", "run", "--agent-id", agentId],
     {
@@ -120,83 +107,102 @@ async function triggerHeartbeat(agentId: string): Promise<void> {
       },
     }
   );
-  // Don't await — let heartbeat run in background
+
+  log("INFO", `heartbeat triggered`, { agentId: agentId.slice(0, 8), repo });
+
   proc.exited.then((code) => {
-    console.log(`  heartbeat for ${agentId} exited: ${code}`);
+    if (code === 0) {
+      log("INFO", `heartbeat completed`, { agentId: agentId.slice(0, 8), repo, exitCode: code });
+    } else {
+      log("WARN", `heartbeat exited with non-zero code`, { agentId: agentId.slice(0, 8), repo, exitCode: code });
+    }
   });
 }
 
-async function processEvent(
-  event: QueueEvent,
-  ceoKey: string
-): Promise<void> {
-  console.log(
-    `processing: ${event.repo}#${event.prNumber} by ${event.author}`
-  );
+async function processEvent(event: QueueEvent, ceoKey: string): Promise<void> {
+  log("INFO", `processing event`, {
+    repo: event.repo,
+    pr: event.prNumber,
+    author: event.author,
+    branch: event.branch ?? "(none)",
+    comment: event.comment.slice(0, 80) + (event.comment.length > 80 ? "…" : ""),
+    enqueuedAt: event.timestamp,
+  });
 
   const agentId = REPO_AGENT_MAP[event.repo];
   if (!agentId) {
-    console.log(`  no agent mapped for repo ${event.repo}, skipping`);
+    log("WARN", `no agent mapped for repo — skipping`, { repo: event.repo });
     return;
   }
 
-  // Try to find the DON issue
   const identifier = extractDonIdentifier(event.branch, event.prTitle);
 
   if (identifier) {
+    log("INFO", `resolved Paperclip issue`, { identifier, branch: event.branch });
     const issue = await findIssueByIdentifier(identifier, ceoKey);
     if (issue) {
       const commentBody = `## PR Comment from @${event.author}\n\n> ${event.comment.split("\n").join("\n> ")}\n\n**PR:** [${event.prTitle}](${event.prUrl}) (#${event.prNumber})`;
       await postComment(issue.id, commentBody, ceoKey);
-      console.log(`  posted comment to ${identifier}`);
+      log("INFO", `posted comment to Paperclip issue`, { identifier, issueId: issue.id.slice(0, 8) });
     } else {
-      console.log(`  issue ${identifier} not found in Paperclip`);
+      log("WARN", `issue not found in Paperclip`, { identifier });
     }
   } else {
-    console.log(`  no DON identifier found in branch/title`);
+    log("WARN", `no DON identifier found`, { branch: event.branch, title: event.prTitle });
   }
 
-  // Trigger heartbeat for the lead
-  console.log(`  triggering heartbeat for ${event.repo} lead`);
-  await triggerHeartbeat(agentId);
+  await triggerHeartbeat(agentId, event.repo);
 }
 
 async function poll(redis: any, ceoKey: string): Promise<void> {
+  let count = 0;
   while (true) {
     const raw = await redis.send("LPOP", [QUEUE_KEY]);
     if (!raw) break;
-
+    count++;
     try {
       const event: QueueEvent = JSON.parse(raw as string);
       await processEvent(event, ceoKey);
     } catch (e) {
-      console.error("failed to process event:", e);
+      log("ERROR", `failed to process event`, { error: String(e) });
     }
+  }
+  if (count > 0) {
+    log("INFO", `poll cycle complete`, { processed: count });
   }
 }
 
 async function main() {
-  console.log("hermod poller starting...");
-  console.log(`redis: ${REDIS_URL.replace(/:[^:@]+@/, ":***@")}`);
-  console.log(`paperclip: ${PAPERCLIP_API_URL}`);
-  console.log(`poll interval: ${POLL_INTERVAL}ms`);
+  log("INFO", "hermod poller starting", {
+    redis: REDIS_URL.replace(/:[^:@]+@/, ":***@"),
+    paperclip: PAPERCLIP_API_URL,
+    pollIntervalMs: POLL_INTERVAL,
+    mappedRepos: Object.keys(REPO_AGENT_MAP),
+  });
 
   const redis = new Bun.RedisClient(REDIS_URL);
 
-  // Get CEO API key for posting comments
-  const ceoKey = await getPaperclipApiKey(CEO_AGENT_ID);
-  if (!ceoKey) {
-    console.error("could not get CEO API key");
+  // Verify Redis connection
+  try {
+    await redis.send("PING", []);
+    log("INFO", "Redis connection OK");
+  } catch (e) {
+    log("ERROR", "Redis connection failed", { error: String(e) });
     process.exit(1);
   }
-  console.log("authenticated as CEO");
+
+  const ceoKey = await getPaperclipApiKey(CEO_AGENT_ID);
+  if (!ceoKey) {
+    log("ERROR", "could not get CEO API key");
+    process.exit(1);
+  }
+  log("INFO", "authenticated as CEO");
 
   // Initial drain
   await poll(redis, ceoKey);
 
-  // Poll loop
+  log("INFO", `polling every ${POLL_INTERVAL}ms`);
   setInterval(() => poll(redis, ceoKey), POLL_INTERVAL);
-  console.log("polling...");
 }
 
 main();
