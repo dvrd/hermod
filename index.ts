@@ -335,6 +335,71 @@ Bun.serve({
         return new Response(res.body, { status: res.status, headers: { "content-type": "application/json" } });
       }
 
+      // GET /coolify/logs/stream/:appName — SSE stream of container logs (follow mode)
+      const logsStreamMatch = subpath.match(/^\/logs\/stream\/([a-z0-9_-]+)$/);
+      if (logsStreamMatch && req.method === "GET") {
+        const tail = url.searchParams.get("tail") || "100";
+        const since = url.searchParams.get("since"); // e.g., "10m", "1h"
+
+        // First, get the container name from Coolify
+        const appRes = await fetch(`${COOLIFY_API_URL}/applications/${scope.appUuid}`, {
+          headers: coolifyHeaders,
+        });
+        if (!appRes.ok) {
+          return Response.json({ error: "app not found" }, { status: 404 });
+        }
+        const app = await appRes.json() as any;
+        const containerName = app.name || scope.appUuid;
+
+        // Build docker logs command
+        let dockerCmd = `docker logs -f --tail ${tail}`;
+        if (since) dockerCmd += ` --since ${since}`;
+        dockerCmd += ` ${containerName} 2>&1`;
+
+        // Spawn docker process
+        const proc = Bun.spawn({
+          cmd: ["ssh", "kakurega@okane-1", dockerCmd],
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+
+        log("INFO", "coolify proxy: log stream started", { ...audit, container: containerName, tail });
+
+        // Return SSE stream
+        const stream = new ReadableStream({
+          start(controller) {
+            proc.stdout.pipeTo(new WritableStream({
+              write(chunk) {
+                const text = new TextDecoder().decode(chunk);
+                controller.enqueue(`data: ${JSON.stringify({ log: text })}\n\n`);
+              },
+              close() {
+                controller.close();
+              },
+            }));
+
+            proc.stderr.pipeTo(new WritableStream({
+              write(chunk) {
+                const text = new TextDecoder().decode(chunk);
+                controller.enqueue(`data: ${JSON.stringify({ log: text, stderr: true })}\n\n`);
+              },
+            }));
+          },
+          cancel() {
+            proc.kill();
+            log("INFO", "coolify proxy: log stream closed", audit);
+          },
+        });
+
+        return new Response(stream, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+          },
+        });
+      }
+
       log("WARN", "coolify proxy: unknown route", { ...audit, path: subpath, method: req.method });
       return Response.json({ error: "not found" }, { status: 404 });
     }
