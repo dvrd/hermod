@@ -222,7 +222,7 @@ Bun.serve({
       // Resolve agent scope (maps token to app UUID)
       const scope = resolveAgentScope(req);
       if (!scope) {
-        log("WARN", "logs stream: unauthorized token", { ip: getClientIp(req), app: appName });
+        log("WARN", "logs stream: unauthorized token", { app: appName });
         await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
         return Response.json({ error: "unauthorized" }, { status: 401 });
       }
@@ -231,20 +231,8 @@ Bun.serve({
         return Response.json({ error: "rate limited" }, { status: 429 });
       }
 
-      // Get app details from Coolify to find container name
-      const coolifyHeaders = {
-        "Authorization": `Bearer ${COOLIFY_API_KEY}`,
-        "Content-Type": "application/json",
-      };
-
-      const appRes = await fetch(`${COOLIFY_API_URL}/applications/${scope.appUuid}`, {
-        headers: coolifyHeaders,
-      });
-      if (!appRes.ok) {
-        return Response.json({ error: "app not found" }, { status: 404 });
-      }
-      const app = await appRes.json() as any;
-      const containerName = app.name || scope.appUuid;
+      // Use appName from path as container name (matches Docker container naming)
+      const containerName = appName;
 
       // Build docker logs command
       let dockerCmd = `docker logs -f --tail ${tail}`;
@@ -258,7 +246,7 @@ Bun.serve({
         stderr: "pipe",
       });
 
-      log("INFO", "logs stream started", { app: containerName, tail, ip: getClientIp(req) });
+      log("INFO", "logs stream started", { app: containerName, tail });
 
       // Return SSE stream
       const stream = new ReadableStream({
