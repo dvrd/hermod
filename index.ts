@@ -23,12 +23,7 @@ const AGENT_TOKENS: Record<string, string> = (() => {
   }
 })();
 
-// IP allowlist for /coolify/* routes (comma-separated)
-// Set to your static IP(s). Empty = disabled (token-only auth).
-const COOLIFY_ALLOWED_IPS = (process.env.COOLIFY_ALLOWED_IPS || "")
-  .split(",")
-  .map(ip => ip.trim())
-  .filter(Boolean);
+// Note: IP allowlist removed - using token-only auth for all agent routes
 
 // Rate limiter: per-token sliding window (requests per minute)
 const COOLIFY_RATE_LIMIT = Number(process.env.COOLIFY_RATE_LIMIT) || 20;
@@ -45,14 +40,7 @@ function checkRateLimit(token: string): boolean {
   return bucket.count <= COOLIFY_RATE_LIMIT;
 }
 
-function getClientIp(req: Request): string {
-  // Traefik sets X-Forwarded-For; use the leftmost (original client)
-  const xff = req.headers.get("x-forwarded-for");
-  if (xff) return xff.split(",")[0].trim();
-  const real = req.headers.get("x-real-ip");
-  if (real) return real.trim();
-  return "unknown";
-}
+
 
 function resolveAgentScope(req: Request): { appUuid: string; token: string } | null {
   const auth = req.headers.get("authorization") || "";
@@ -307,60 +295,43 @@ Bun.serve({
       });
     }
 
-    if (path.startsWith("/coolify/")) {
+    // ── Scoped agent routes (no /coolify prefix) ──
+    // Each agent's token maps to exactly one Coolify app UUID
+    // Routes: /deployments, /deployments/:uuid, /envs, /deploy
+
+    const agentScope = resolveAgentScope(req);
+    if (agentScope) {
       if (!COOLIFY_API_KEY) {
         return Response.json({ error: "Coolify proxy not configured" }, { status: 503 });
       }
 
-      const clientIp = getClientIp(req);
-
-      // Layer 1: IP allowlist
-      if (COOLIFY_ALLOWED_IPS.length > 0 && !COOLIFY_ALLOWED_IPS.includes(clientIp)) {
-        log("WARN", "coolify proxy: blocked IP", { ip: clientIp, path });
-        return Response.json({ error: "forbidden" }, { status: 403 });
-      }
-
-      // Layer 2: Token auth
-      const scope = resolveAgentScope(req);
-      if (!scope) {
-        log("WARN", "coolify proxy: unauthorized token", { ip: clientIp });
-        // Constant-time delay to prevent timing-based token enumeration
-        await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
-        return Response.json({ error: "unauthorized" }, { status: 401 });
-      }
-
-      // Layer 3: Rate limit
-      if (!checkRateLimit(scope.token)) {
-        log("WARN", "coolify proxy: rate limited", { ip: clientIp, app: scope.appUuid });
+      if (!checkRateLimit(agentScope.token)) {
+        log("WARN", "agent: rate limited", { app: agentScope.appUuid });
         return Response.json({ error: "rate limited" }, { status: 429 });
       }
 
-      // Audit prefix for all proxy logs
-      const audit = { ip: clientIp, app: scope.appUuid };
+      const audit = { app: agentScope.appUuid };
 
       const coolifyHeaders = {
         "Authorization": `Bearer ${COOLIFY_API_KEY}`,
         "Content-Type": "application/json",
       };
 
-      const subpath = path.replace("/coolify", "");
-
-      // GET /coolify/deployments — list recent deployments for this app
-      if (subpath === "/deployments" && req.method === "GET") {
+      // GET /deployments — list recent deployments for this app
+      if (path === "/deployments" && req.method === "GET") {
         const res = await fetch(`${COOLIFY_API_URL}/deployments?limit=10`, {
           headers: coolifyHeaders,
         });
         const all = await res.json() as any[];
-        // Filter to only this agent's app
         const filtered = Array.isArray(all)
-          ? all.filter((d: any) => d.application_uuid === scope.appUuid || d.resource_uuid === scope.appUuid)
+          ? all.filter((d: any) => d.application_uuid === agentScope.appUuid || d.resource_uuid === agentScope.appUuid)
           : [];
-        log("INFO", "coolify proxy: list deployments", { ...audit, count: filtered.length });
+        log("INFO", "agent: list deployments", { ...audit, count: filtered.length });
         return Response.json(filtered);
       }
 
-      // GET /coolify/deployments/:uuid — get deployment logs (only if it belongs to this app)
-      const depMatch = subpath.match(/^\/deployments\/([a-z0-9]+)$/);
+      // GET /deployments/:uuid — get deployment (only if belongs to this app)
+      const depMatch = path.match(/^\/deployments\/([a-z0-9]+)$/);
       if (depMatch && req.method === "GET") {
         const depUuid = depMatch[1];
         const res = await fetch(`${COOLIFY_API_URL}/deployments/${depUuid}`, {
@@ -368,68 +339,68 @@ Bun.serve({
         });
         if (!res.ok) return Response.json({ error: "not found" }, { status: 404 });
         const dep = await res.json() as any;
-        // Verify this deployment belongs to the agent's app
-        if (dep.application_uuid !== scope.appUuid && dep.resource_uuid !== scope.appUuid) {
-          log("WARN", "coolify proxy: deployment scope mismatch", { ...audit, dep: depUuid });
+        if (dep.application_uuid !== agentScope.appUuid && dep.resource_uuid !== agentScope.appUuid) {
+          log("WARN", "agent: deployment scope mismatch", { ...audit, dep: depUuid });
           return Response.json({ error: "forbidden" }, { status: 403 });
         }
-        log("INFO", "coolify proxy: get deployment", { ...audit, dep: depUuid });
+        log("INFO", "agent: get deployment", { ...audit, dep: depUuid });
         return Response.json(dep);
       }
 
-      // GET /coolify/envs — list env vars for this app
-      if (subpath === "/envs" && req.method === "GET") {
-        const res = await fetch(`${COOLIFY_API_URL}/applications/${scope.appUuid}/envs`, {
+      // GET /envs — list env vars for this app
+      if (path === "/envs" && req.method === "GET") {
+        const res = await fetch(`${COOLIFY_API_URL}/applications/${agentScope.appUuid}/envs`, {
           headers: coolifyHeaders,
         });
-        log("INFO", "coolify proxy: list envs", audit);
+        log("INFO", "agent: list envs", audit);
         return new Response(res.body, { status: res.status, headers: { "content-type": "application/json" } });
       }
 
-      // PATCH /coolify/envs — update env var for this app
-      if (subpath === "/envs" && req.method === "PATCH") {
+      // PATCH /envs — update env var for this app
+      if (path === "/envs" && req.method === "PATCH") {
         const body = await req.text();
-        const res = await fetch(`${COOLIFY_API_URL}/applications/${scope.appUuid}/envs`, {
+        const res = await fetch(`${COOLIFY_API_URL}/applications/${agentScope.appUuid}/envs`, {
           method: "PATCH",
           headers: coolifyHeaders,
           body,
         });
-        log("INFO", "coolify proxy: update env", audit);
+        log("INFO", "agent: update env", audit);
         return new Response(res.body, { status: res.status, headers: { "content-type": "application/json" } });
       }
 
-      // DELETE /coolify/envs/:uuid — delete env var for this app
-      const envDelMatch = subpath.match(/^\/envs\/([a-z0-9]+)$/);
+      // DELETE /envs/:uuid — delete env var for this app
+      const envDelMatch = path.match(/^\/envs\/([a-z0-9]+)$/);
       if (envDelMatch && req.method === "DELETE") {
         const envUuid = envDelMatch[1];
-        const res = await fetch(`${COOLIFY_API_URL}/applications/${scope.appUuid}/envs/${envUuid}`, {
+        const res = await fetch(`${COOLIFY_API_URL}/applications/${agentScope.appUuid}/envs/${envUuid}`, {
           method: "DELETE",
           headers: coolifyHeaders,
         });
-        log("INFO", "coolify proxy: delete env", { ...audit, env: envUuid });
+        log("INFO", "agent: delete env", { ...audit, env: envUuid });
         return new Response(res.body, { status: res.status, headers: { "content-type": "application/json" } });
       }
 
-      // POST /coolify/deploy — trigger deploy for this app only
-      if (subpath === "/deploy" && req.method === "POST") {
-        const res = await fetch(`${COOLIFY_API_URL}/deploy?uuid=${scope.appUuid}`, {
+      // POST /deploy — trigger deploy for this app
+      if (path === "/deploy" && req.method === "POST") {
+        const res = await fetch(`${COOLIFY_API_URL}/deploy?uuid=${agentScope.appUuid}`, {
           headers: coolifyHeaders,
         });
-        log("INFO", "coolify proxy: deploy triggered", audit);
+        log("INFO", "agent: deploy triggered", audit);
         return new Response(res.body, { status: res.status, headers: { "content-type": "application/json" } });
       }
 
-      log("WARN", "coolify proxy: unknown route", { ...audit, path: subpath, method: req.method });
+      log("WARN", "agent: unknown route", { ...audit, path, method: req.method });
       return Response.json({ error: "not found" }, { status: 404 });
     }
 
+    // No token matched any route
     return new Response("not found", { status: 404 });
   },
 });
 
 log("INFO", `hermod server listening on :${PORT}`);
 if (Object.keys(AGENT_TOKENS).length > 0) {
-  log("INFO", `coolify proxy: ${Object.keys(AGENT_TOKENS).length} agent tokens configured`);
+  log("INFO", `${Object.keys(AGENT_TOKENS).length} agent tokens configured`);
 } else {
-  log("WARN", "coolify proxy: no agent tokens configured (set HERMOD_AGENT_TOKENS)");
+  log("WARN", "no agent tokens configured (set HERMOD_AGENT_TOKENS)");
 }
