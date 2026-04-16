@@ -223,6 +223,90 @@ Bun.serve({
     //   4. Route whitelist — only specific Coolify operations are proxied
     //   5. Audit log — every request is logged with IP, token, and action
 
+    // GET /logs/stream/:appName — SSE stream of container logs (follow mode)
+    // Accessible with agent token, outside /coolify namespace
+    const logsStreamMatch = path.match(/^\/logs\/stream\/([a-z0-9_-]+)$/);
+    if (logsStreamMatch && req.method === "GET") {
+      const appName = logsStreamMatch[1];
+      const tail = url.searchParams.get("tail") || "100";
+      const since = url.searchParams.get("since"); // e.g., "10m", "1h"
+
+      // Resolve agent scope (maps token to app UUID)
+      const scope = resolveAgentScope(req);
+      if (!scope) {
+        log("WARN", "logs stream: unauthorized token", { ip: getClientIp(req), app: appName });
+        await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+
+      if (!checkRateLimit(scope.token)) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+
+      // Get app details from Coolify to find container name
+      const coolifyHeaders = {
+        "Authorization": `Bearer ${COOLIFY_API_KEY}`,
+        "Content-Type": "application/json",
+      };
+
+      const appRes = await fetch(`${COOLIFY_API_URL}/applications/${scope.appUuid}`, {
+        headers: coolifyHeaders,
+      });
+      if (!appRes.ok) {
+        return Response.json({ error: "app not found" }, { status: 404 });
+      }
+      const app = await appRes.json() as any;
+      const containerName = app.name || scope.appUuid;
+
+      // Build docker logs command
+      let dockerCmd = `docker logs -f --tail ${tail}`;
+      if (since) dockerCmd += ` --since ${since}`;
+      dockerCmd += ` ${containerName} 2>&1`;
+
+      // Spawn docker process via SSH to okane-1
+      const proc = Bun.spawn({
+        cmd: ["ssh", "kakurega@okane-1", dockerCmd],
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      log("INFO", "logs stream started", { app: containerName, tail, ip: getClientIp(req) });
+
+      // Return SSE stream
+      const stream = new ReadableStream({
+        start(controller) {
+          proc.stdout.pipeTo(new WritableStream({
+            write(chunk) {
+              const text = new TextDecoder().decode(chunk);
+              controller.enqueue(`data: ${JSON.stringify({ log: text })}\n\n`);
+            },
+            close() {
+              controller.close();
+            },
+          }));
+
+          proc.stderr.pipeTo(new WritableStream({
+            write(chunk) {
+              const text = new TextDecoder().decode(chunk);
+              controller.enqueue(`data: ${JSON.stringify({ log: text, stderr: true })}\n\n`);
+            },
+          }));
+        },
+        cancel() {
+          proc.kill();
+          log("INFO", "logs stream closed", { app: containerName });
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
+    }
+
     if (path.startsWith("/coolify/")) {
       if (!COOLIFY_API_KEY) {
         return Response.json({ error: "Coolify proxy not configured" }, { status: 503 });
@@ -333,71 +417,6 @@ Bun.serve({
         });
         log("INFO", "coolify proxy: deploy triggered", audit);
         return new Response(res.body, { status: res.status, headers: { "content-type": "application/json" } });
-      }
-
-      // GET /coolify/logs/stream/:appName — SSE stream of container logs (follow mode)
-      const logsStreamMatch = subpath.match(/^\/logs\/stream\/([a-z0-9_-]+)$/);
-      if (logsStreamMatch && req.method === "GET") {
-        const tail = url.searchParams.get("tail") || "100";
-        const since = url.searchParams.get("since"); // e.g., "10m", "1h"
-
-        // First, get the container name from Coolify
-        const appRes = await fetch(`${COOLIFY_API_URL}/applications/${scope.appUuid}`, {
-          headers: coolifyHeaders,
-        });
-        if (!appRes.ok) {
-          return Response.json({ error: "app not found" }, { status: 404 });
-        }
-        const app = await appRes.json() as any;
-        const containerName = app.name || scope.appUuid;
-
-        // Build docker logs command
-        let dockerCmd = `docker logs -f --tail ${tail}`;
-        if (since) dockerCmd += ` --since ${since}`;
-        dockerCmd += ` ${containerName} 2>&1`;
-
-        // Spawn docker process
-        const proc = Bun.spawn({
-          cmd: ["ssh", "kakurega@okane-1", dockerCmd],
-          stdout: "pipe",
-          stderr: "pipe",
-        });
-
-        log("INFO", "coolify proxy: log stream started", { ...audit, container: containerName, tail });
-
-        // Return SSE stream
-        const stream = new ReadableStream({
-          start(controller) {
-            proc.stdout.pipeTo(new WritableStream({
-              write(chunk) {
-                const text = new TextDecoder().decode(chunk);
-                controller.enqueue(`data: ${JSON.stringify({ log: text })}\n\n`);
-              },
-              close() {
-                controller.close();
-              },
-            }));
-
-            proc.stderr.pipeTo(new WritableStream({
-              write(chunk) {
-                const text = new TextDecoder().decode(chunk);
-                controller.enqueue(`data: ${JSON.stringify({ log: text, stderr: true })}\n\n`);
-              },
-            }));
-          },
-          cancel() {
-            proc.kill();
-            log("INFO", "coolify proxy: log stream closed", audit);
-          },
-        });
-
-        return new Response(stream, {
-          headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-          },
-        });
       }
 
       log("WARN", "coolify proxy: unknown route", { ...audit, path: subpath, method: req.method });
