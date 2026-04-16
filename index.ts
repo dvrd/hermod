@@ -239,9 +239,9 @@ Bun.serve({
       if (since) dockerCmd += ` --since ${since}`;
       dockerCmd += ` ${containerName} 2>&1`;
 
-      // Spawn docker process via SSH to okane-1 (using FQDN)
+      // Spawn docker process directly (socket mounted from host)
       const proc = Bun.spawn({
-        cmd: ["ssh", "-o", "StrictHostKeyChecking=no", "kakurega@okane-1.donostia.ai", dockerCmd],
+        cmd: ["sh", "-c", dockerCmd],
         stdout: "pipe",
         stderr: "pipe",
       });
